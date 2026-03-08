@@ -112,27 +112,45 @@ async def fetch_filing_text(cik: str, accession_number: str) -> str:
         # Get the filing index to find the primary document
         r = await client.get(index_url)
         if r.status_code != 200:
-            # Try alternate index URL
-            index_url2 = f"{SEC_BASE}/cgi-bin/browse-edgar?action=getcompany&filenum=&State=0&SIC=&dateb=&owner=include&count=1&search_text=&action=getcompany"
             raise HTTPException(status_code=502,
                                 detail="Could not retrieve filing index.")
 
         soup = BeautifulSoup(r.text, "html.parser")
-        # Find the primary document link (first .htm or .txt that isn't the index)
+        
+        # Find the Document Format Files table
         doc_link = None
-        for row in soup.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) >= 3:
-                link_tag = cells[2].find("a") if len(cells) > 2 else None
-                if link_tag and link_tag.get("href"):
-                    href = link_tag["href"]
-                    if href.endswith((".htm", ".html",
-                                      ".txt")) and "index" not in href.lower():
-                        doc_link = f"{SEC_BASE}{href}"
-                        break
+        tables = soup.find_all("table")
+        
+        for table in tables:
+            # Look for the table that contains document format files
+            rows = table.find_all("tr")
+            for i, row in enumerate(rows):
+                cells = row.find_all("td")
+                # Check if this is a document row (has at least 3 columns)
+                if len(cells) >= 3:
+                    # Get the filename from the first column
+                    filename_cell = cells[0].get_text(strip=True)
+                    # Look for link in the cells
+                    link_tag = cells[0].find("a")
+                    if not link_tag and len(cells) > 1:
+                        link_tag = cells[1].find("a")
+                    
+                    if link_tag and link_tag.get("href"):
+                        href = link_tag["href"]
+                        # Skip index files and focus on primary documents (.htm, .txt)
+                        if href.endswith((".htm", ".html", ".txt")) and "index" not in href.lower():
+                            doc_link = href
+                            if not doc_link.startswith("http"):
+                                doc_link = f"{SEC_BASE}{doc_link}"
+                            break
+            
+            # If we found a document link, stop searching tables
+            if doc_link:
+                break
 
+        # Fallback: try to construct the primary document URL from accession number
         if not doc_link:
-            # Fallback: use the accession number text file
+            # SEC filings typically have a .txt file with the accession number
             doc_link = f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{acc_clean}/{accession_number}.txt"
 
         doc_r = await client.get(doc_link, timeout=30)
