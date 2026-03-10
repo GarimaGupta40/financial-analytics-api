@@ -14,7 +14,11 @@ from database import SessionLocal, engine
 import models
 
 # Ensure tables are created
-models.Base.metadata.create_all(bind=engine)
+try:
+    models.Base.metadata.create_all(bind=engine)
+    print("Database connected successfully")
+except Exception as e:
+    print("Database connection failed:", e)
 
 app = FastAPI(
     title="Financial Data Extraction & Acquisition Analytics API",
