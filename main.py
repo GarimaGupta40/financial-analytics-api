@@ -1,21 +1,26 @@
-"""
-SEC EDGAR Filing Text Extraction API
-Pulls text from 10-K, 10-Q, 8-K, DEF 14A, Form 4, S-1 filings for any public company.
-"""
-
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-import re
-import json
-from typing import Optional
-from bs4 import BeautifulSoup
+from datetime import datetime
+
+from sec_client import sec_client
+import xbrl_parser
+import financial_metrics
+import valuation_engine
+import peer_analysis
+import acquisition_scoring
+import trend_analysis
+
+from database import SessionLocal, engine
+import models
+
+# Ensure tables are created
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="SEC EDGAR Filing API",
-    description=
-    "Extract text from SEC filings (10-K, 10-Q, 8-K, DEF 14A, Form 4, S-1) for any public company.",
-    version="1.0.0")
+    title="Financial Data Extraction & Acquisition Analytics API",
+    description="Production-level SEC XBRL data pipeline and analytics engine.",
+    version="2.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,328 +29,263 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EDGAR_BASE = "https://data.sec.gov"
-EDGAR_SEARCH = "https://efts.sec.gov"
-SEC_BASE = "https://www.sec.gov"
+@app.on_event("shutdown")
+async def shutdown_event():
+    await sec_client.close()
 
-HEADERS = {
-    "User-Agent":
-    "SEC Filing API garimagupta112003@gmail.com",  # SEC requires User-Agent
-    "Accept-Encoding": "gzip, deflate",
-    "Host": "data.sec.gov"
-}
-
-SUPPORTED_FORMS = {
-    "10-K":
-    "Annual Report – comprehensive overview, audited financials, and risk factors",
-    "10-Q": "Quarterly Report – unaudited financials for Q1-Q3",
-    "8-K": "Current Report – major unscheduled corporate events",
-    "DEF 14A":
-    "Proxy Statement – shareholder vote info (board elections, exec compensation)",
-    "4":
-    "Form 4 – insider transactions (directors, officers, beneficial owners)",
-    "S-1": "Registration Statement – filed prior to an IPO",
-}
-
-
-# ─────────────────────────────────────────────
-# Helper: Resolve ticker → CIK
-# ─────────────────────────────────────────────
-async def get_cik_from_ticker(ticker: str) -> str:
-    url = f"{SEC_BASE}/files/company_tickers.json"
-    async with httpx.AsyncClient(
-            headers={"User-Agent": "SEC Filing API research@example.com"
-                     }) as client:
-        r = await client.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-
+async def build_full_report(ticker: str, form_type: str = "10-K"):
     ticker_upper = ticker.upper()
-    for entry in data.values():
-        if entry["ticker"].upper() == ticker_upper:
-            return str(entry["cik_str"]).zfill(10)
-
-    raise HTTPException(status_code=404,
-                        detail=f"Ticker '{ticker}' not found in SEC database.")
-
-
-# ─────────────────────────────────────────────
-# Helper: Get filings list for a CIK
-# ─────────────────────────────────────────────
-async def get_company_submissions(cik_padded: str) -> dict:
-    url = f"{EDGAR_BASE}/submissions/CIK{cik_padded}.json"
-    async with httpx.AsyncClient(
-            headers={"User-Agent": "SEC Filing API research@example.com"
-                     }) as client:
-        r = await client.get(url, timeout=15)
-        if r.status_code == 404:
-            raise HTTPException(status_code=404,
-                                detail=f"CIK {cik_padded} not found in EDGAR.")
-        r.raise_for_status()
-        return r.json()
-
-
-# ─────────────────────────────────────────────
-# Helper: Extract text from an HTML/text filing
-# ─────────────────────────────────────────────
-def clean_html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "head", "meta"]):
-        tag.decompose()
-    text = soup.get_text(separator="\n")
-    # Collapse excessive blank lines
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
-
-
-# ─────────────────────────────────────────────
-# Helper: Fetch filing document text
-# ─────────────────────────────────────────────
-async def fetch_filing_text(cik: str, accession_number: str) -> str:
-    acc_clean = accession_number.replace("-", "")
-    index_url = f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{acc_clean}/{accession_number}-index.htm"
-
-    async with httpx.AsyncClient(
-            headers={"User-Agent": "SEC Filing API research@example.com"},
-            follow_redirects=True,
-            timeout=30) as client:
-        # Get the filing index to find the primary document
-        r = await client.get(index_url)
-        if r.status_code != 200:
-            raise HTTPException(status_code=502,
-                                detail="Could not retrieve filing index.")
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        
-        # Find the Document Format Files table
-        doc_link = None
-        tables = soup.find_all("table")
-        
-        for table in tables:
-            # Look for the table that contains document format files
-            rows = table.find_all("tr")
-            for i, row in enumerate(rows):
-                cells = row.find_all("td")
-                # Check if this is a document row (has at least 3 columns)
-                if len(cells) >= 3:
-                    # Get the filename from the first column
-                    filename_cell = cells[0].get_text(strip=True)
-                    # Look for link in the cells
-                    link_tag = cells[0].find("a")
-                    if not link_tag and len(cells) > 1:
-                        link_tag = cells[1].find("a")
-                    
-                    if link_tag and link_tag.get("href"):
-                        href = link_tag["href"]
-                        # Skip index files and focus on primary documents (.htm, .txt)
-                        if href.endswith((".htm", ".html", ".txt")) and "index" not in href.lower():
-                            doc_link = href
-                            if not doc_link.startswith("http"):
-                                doc_link = f"{SEC_BASE}{doc_link}"
-                            break
+    cik = await xbrl_parser.get_cik_from_ticker(ticker_upper)
+    subs = await xbrl_parser.get_company_submissions(cik)
+    
+    facts = await xbrl_parser.get_company_facts(cik)
+    facts_gaap = facts.get("facts", {}).get("us-gaap", {})
+    
+    statements = xbrl_parser.extract_financial_data(facts_gaap)
+    historical = xbrl_parser.get_historical_data(facts_gaap)
+    
+    metrics = financial_metrics.calculate_metrics(statements)
+    growth = financial_metrics.calculate_growth(statements, historical)
+    
+    valuation = await valuation_engine.calculate_valuation(ticker_upper, statements)
+    metrics["valuation"] = valuation
+    
+    peers = await peer_analysis.get_peer_comparison(cik, subs.get("sic", ""), ticker_upper, metrics)
+    acq = acquisition_scoring.score_acquisition(metrics, growth, statements)
+    
+    recent_forms = subs.get("filings", {}).get("recent", {})
+    forms = recent_forms.get("form", [])
+    dates = recent_forms.get("filingDate", [])
+    
+    match_idx = -1
+    for i, form in enumerate(forms):
+        if form.upper() == form_type.upper():
+            match_idx = i
+            break
             
-            # If we found a document link, stop searching tables
-            if doc_link:
-                break
+    if match_idx == -1:
+        raise HTTPException(status_code=404, detail=f"No {form_type} filings found for {ticker.upper()}.")
+        
+    filing_date = dates[match_idx] if match_idx < len(dates) else ""
 
-        # Fallback: try to construct the primary document URL from accession number
-        if not doc_link:
-            # SEC filings typically have a .txt file with the accession number
-            doc_link = f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{acc_clean}/{accession_number}.txt"
-
-        doc_r = await client.get(doc_link, timeout=30)
-        if doc_r.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not fetch document at {doc_link}")
-
-        return clean_html_to_text(doc_r.text)
-
-
-# ═══════════════════════════════════════════════════════════════
-# ENDPOINTS
-# ═══════════════════════════════════════════════════════════════
-
-
-@app.get("/", summary="API Info")
-def root():
     return {
-        "api": "SEC EDGAR Filing Text Extraction API",
-        "supported_form_types": SUPPORTED_FORMS,
-        "endpoints": {
-            "GET /company/{ticker}":
-            "Get company info and filing history",
-            "GET /filings/{ticker}":
-            "List filings by form type",
-            "GET /filing/text":
-            "Extract full text from a specific filing",
-            "GET /filing/latest":
-            "Get text from the most recent filing of a given type",
+        "company_info": {
+            "ticker": ticker_upper,
+            "company_name": subs.get("name"),
+            "cik": cik,
+            "form_type": form_type.upper(),
+            "filing_date": filing_date
+        },
+        "financial_statements": statements,
+        "financial_metrics": metrics,
+        "growth_metrics": growth,
+        "acquisition_indicators": acq,
+        "metadata": {
+            "data_source": "SEC EDGAR XBRL",
+            "currency": "USD",
+            "units": "full",
+            "extraction_timestamp": datetime.utcnow().isoformat() + "Z"
         }
     }
 
-
-@app.get("/forms", summary="List supported filing types")
-def list_forms():
-    return {"supported_forms": SUPPORTED_FORMS}
-
-
-@app.get("/company/{ticker}", summary="Get company info + recent filings")
-async def get_company_info(ticker: str):
-    """Resolve a ticker to its CIK and return company metadata."""
-    cik = await get_cik_from_ticker(ticker)
-    data = await get_company_submissions(cik)
-
-    recent = data.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    dates = recent.get("filingDate", [])
-    accessions = recent.get("accessionNumber", [])
-
-    # Group by form type
-    filings_by_type: dict = {}
-    for form, date, acc in zip(forms, dates, accessions):
-        form_key = form.strip()
-        if form_key not in filings_by_type:
-            filings_by_type[form_key] = []
-        if len(filings_by_type[form_key]) < 5:  # last 5 per type
-            filings_by_type[form_key].append({
-                "date": date,
-                "accession_number": acc
-            })
-
+@app.get("/company/{ticker}")
+async def get_company(ticker: str):
+    cik = await xbrl_parser.get_cik_from_ticker(ticker)
+    subs = await xbrl_parser.get_company_submissions(cik)
     return {
         "ticker": ticker.upper(),
         "cik": cik,
-        "company_name": data.get("name"),
-        "sic": data.get("sic"),
-        "sic_description": data.get("sicDescription"),
-        "state_of_incorporation": data.get("stateOfIncorporation"),
-        "fiscal_year_end": data.get("fiscalYearEnd"),
-        "recent_filings_by_type": filings_by_type,
+        "company_name": subs.get("name"),
+        "sic": subs.get("sic")
     }
 
+@app.get("/financials/{ticker}")
+async def get_financials(ticker: str):
+    cik = await xbrl_parser.get_cik_from_ticker(ticker)
+    facts = await xbrl_parser.get_company_facts(cik)
+    facts_gaap = facts.get("facts", {}).get("us-gaap", {})
+    statements = xbrl_parser.extract_financial_data(facts_gaap)
+    return {"financial_statements": statements}
 
-@app.get("/filings/{ticker}", summary="List filings for a given form type")
-async def list_filings(
-    ticker: str,
-    form_type: str = Query(
-        ..., description="e.g. 10-K, 10-Q, 8-K, DEF 14A, 4, S-1"),
-    count: int = Query(10,
-                       ge=1,
-                       le=40,
-                       description="Number of filings to return")):
-    """List filings for a company filtered by form type."""
-    cik = await get_cik_from_ticker(ticker)
-    data = await get_company_submissions(cik)
-
-    recent = data.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    dates = recent.get("filingDate", [])
-    accessions = recent.get("accessionNumber", [])
-    descriptions = recent.get("primaryDocument", [])
-
-    results = []
-    form_type_upper = form_type.strip().upper()
-
-    for form, date, acc, desc in zip(forms, dates, accessions, descriptions):
-        if form.strip().upper() == form_type_upper:
-            results.append({
-                "form_type":
-                form,
-                "filing_date":
-                date,
-                "accession_number":
-                acc,
-                "primary_document":
-                desc,
-                "filing_url":
-                f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{acc.replace('-','')}/{acc}-index.htm",
-            })
-            if len(results) >= count:
-                break
-
-    if not results:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No {form_type} filings found for {ticker.upper()}.")
-
+@app.get("/metrics/{ticker}")
+async def get_metrics(ticker: str):
+    res = await build_full_report(ticker)
     return {
-        "ticker": ticker.upper(),
-        "cik": cik,
-        "company_name": data.get("name"),
-        "form_type": form_type,
-        "count": len(results),
-        "filings": results,
+        "financial_metrics": res["financial_metrics"],
+        "growth_metrics": res["growth_metrics"]
     }
 
+@app.get("/peer-analysis/{ticker}")
+async def get_peer_analysis(ticker: str):
+    ticker_upper = ticker.upper()
+    cik = await xbrl_parser.get_cik_from_ticker(ticker_upper)
+    subs = await xbrl_parser.get_company_submissions(cik)
+    peers = await peer_analysis.get_peer_comparison(cik, subs.get("sic", ""), ticker_upper, {})
+    return {"peer_comparison": peers}
 
-@app.get("/filing/text", summary="Extract full text from a specific filing")
-async def get_filing_text(
-        ticker: str = Query(..., description="Company ticker, e.g. AAPL"),
-        accession_number: str = Query(
-            ..., description="Accession number, e.g. 0000320193-23-000106"),
-        max_chars: int = Query(50000,
-                               ge=1000,
-                               le=500000,
-                               description="Max characters to return")):
-    """Fetch and extract clean text from a specific SEC filing by accession number."""
-    cik = await get_cik_from_ticker(ticker)
-    text = await fetch_filing_text(cik, accession_number)
+@app.get("/acquisition-score/{ticker}")
+async def get_acquisition_score(ticker: str):
+    res = await build_full_report(ticker)
+    return {"acquisition_score": res["acquisition_indicators"]}
+    
+def insert_report_to_db(report: dict):
+    db = SessionLocal()
+    try:
+        c_info = report["company_info"]
+        
+        # Insert or update company
+        existing_company = db.query(models.Company).filter(models.Company.ticker == c_info["ticker"]).first()
+        if existing_company:
+            existing_company.company_name = c_info["company_name"]
+            existing_company.cik = c_info["cik"]
+            existing_company.form_type = c_info["form_type"]
+            existing_company.filing_date = c_info["filing_date"]
+            db.commit()
+            db.refresh(existing_company)
+            company_id = existing_company.id
+        else:
+            company = models.Company(
+                ticker=c_info["ticker"],
+                company_name=c_info["company_name"],
+                cik=c_info["cik"],
+                form_type=c_info["form_type"],
+                filing_date=c_info["filing_date"]
+            )
+            db.add(company)
+            db.commit()
+            db.refresh(company)
+            company_id = company.id
 
-    return {
-        "ticker": ticker.upper(),
-        "cik": cik,
-        "accession_number": accession_number,
-        "total_chars": len(text),
-        "truncated": len(text) > max_chars,
-        "text": text[:max_chars],
-    }
+        filing_date = c_info["filing_date"]
 
+        fs_exists = db.query(models.FinancialStatement).filter(
+            models.FinancialStatement.company_id == company_id,
+            models.FinancialStatement.filing_date == filing_date
+        ).first()
 
-@app.get("/filing/latest",
-         summary="Get text from the most recent filing of a given type")
-async def get_latest_filing_text(
-        ticker: str = Query(..., description="Company ticker, e.g. MSFT"),
-        form_type: str = Query(
-            ..., description="Filing type: 10-K, 10-Q, 8-K, DEF 14A, 4, S-1"),
-        max_chars: int = Query(50000,
-                               ge=1000,
-                               le=500000,
-                               description="Max characters to return")):
-    """Fetch the most recent filing of a given type and return its extracted text."""
-    cik = await get_cik_from_ticker(ticker)
-    data = await get_company_submissions(cik)
+        if fs_exists:
+            db.query(models.FinancialStatement).filter(models.FinancialStatement.company_id == company_id, models.FinancialStatement.filing_date == filing_date).delete()
+            db.query(models.FinancialMetric).filter(models.FinancialMetric.company_id == company_id, models.FinancialMetric.filing_date == filing_date).delete()
+            db.query(models.GrowthMetric).filter(models.GrowthMetric.company_id == company_id, models.GrowthMetric.filing_date == filing_date).delete()
+            db.query(models.AcquisitionIndicator).filter(models.AcquisitionIndicator.company_id == company_id, models.AcquisitionIndicator.filing_date == filing_date).delete()
+            db.query(models.Metadata).filter(models.Metadata.company_id == company_id, models.Metadata.filing_date == filing_date).delete()
+            db.commit()
 
-    recent = data.get("filings", {}).get("recent", {})
-    forms = recent.get("form", [])
-    dates = recent.get("filingDate", [])
-    accessions = recent.get("accessionNumber", [])
+        fs = report["financial_statements"]
+        fstmt = models.FinancialStatement(
+            company_id=company_id,
+            filing_date=filing_date,
+            revenue=fs["income_statement"]["revenue"],
+            cost_of_revenue=fs["income_statement"]["cost_of_revenue"],
+            gross_profit=fs["income_statement"]["gross_profit"],
+            operating_income=fs["income_statement"]["operating_income"],
+            net_income=fs["income_statement"]["net_income"],
+            interest_expense=fs["income_statement"]["interest_expense"],
+            income_tax=fs["income_statement"]["income_tax"],
+            ebit=fs["income_statement"]["ebit"],
+            ebitda=fs["income_statement"]["ebitda"],
+            operating_cash_flow=fs["cash_flow"]["operating_cash_flow"],
+            capital_expenditure=fs["cash_flow"]["capital_expenditure"],
+            depreciation=fs["cash_flow"]["depreciation"],
+            free_cash_flow=fs["cash_flow"]["free_cash_flow"],
+        )
+        db.add(fstmt)
 
-    form_type_upper = form_type.strip().upper()
-    match = None
+        fm = report["financial_metrics"]
+        fmetric = models.FinancialMetric(
+            company_id=company_id,
+            filing_date=filing_date,
+            gross_margin=fm["profitability"]["gross_margin"],
+            operating_margin=fm["profitability"]["operating_margin"],
+            net_profit_margin=fm["profitability"]["net_profit_margin"],
+            roa=fm["profitability"]["roa"],
+            roe=fm["profitability"]["roe"],
+            roic=fm["profitability"]["roic"],
+            ebitda_margin=fm["profitability"]["ebitda_margin"],
+            current_ratio=fm["liquidity"]["current_ratio"],
+            quick_ratio=fm["liquidity"]["quick_ratio"],
+            cash_ratio=fm["liquidity"]["cash_ratio"],
+            debt_to_equity=fm["solvency"]["debt_to_equity"],
+            debt_to_assets=fm["solvency"]["debt_to_assets"],
+            interest_coverage_ratio=fm["solvency"]["interest_coverage_ratio"],
+            price_to_earnings=fm["valuation"]["price_to_earnings"] if fm.get("valuation") else None,
+            price_to_book=fm["valuation"]["price_to_book"] if fm.get("valuation") else None,
+            price_to_sales=fm["valuation"]["price_to_sales"] if fm.get("valuation") else None,
+            enterprise_value=fm["valuation"]["enterprise_value"] if fm.get("valuation") else None,
+            ev_to_ebitda=fm["valuation"]["ev_to_ebitda"] if fm.get("valuation") else None,
+        )
+        db.add(fmetric)
 
-    for form, date, acc in zip(forms, dates, accessions):
-        if form.strip().upper() == form_type_upper:
-            match = {"form": form, "date": date, "accession": acc}
-            break
+        gm = report["growth_metrics"]
+        gmetric = models.GrowthMetric(
+            company_id=company_id,
+            filing_date=filing_date,
+            revenue_growth_yoy=gm["revenue_growth_yoy"],
+            net_income_growth_yoy=gm["net_income_growth_yoy"],
+            free_cash_flow_growth=gm["free_cash_flow_growth"]
+        )
+        db.add(gmetric)
 
-    if not match:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No {form_type} filings found for {ticker.upper()}.")
+        ai = report["acquisition_indicators"]
+        aindicator = models.AcquisitionIndicator(
+            company_id=company_id,
+            filing_date=filing_date,
+            financial_distress=ai["financial_distress"],
+            valuation_attractiveness=ai["valuation_attractiveness"],
+            market_position=ai["market_position"],
+            operational_efficiency=ai["operational_efficiency"]
+        )
+        db.add(aindicator)
 
-    text = await fetch_filing_text(cik, match["accession"])
+        md = report["metadata"]
+        mdata = models.Metadata(
+            company_id=company_id,
+            filing_date=filing_date,
+            data_source=md["data_source"],
+            currency=md["currency"],
+            units=md["units"],
+            extraction_timestamp=datetime.fromisoformat(md["extraction_timestamp"].replace("Z", "+00:00")) if "extraction_timestamp" in md else None
+        )
+        db.add(mdata)
 
-    return {
-        "ticker": ticker.upper(),
-        "cik": cik,
-        "company_name": data.get("name"),
-        "form_type": match["form"],
-        "filing_date": match["date"],
-        "accession_number": match["accession"],
-        "filing_url":
-        f"{SEC_BASE}/Archives/edgar/data/{int(cik)}/{match['accession'].replace('-','')}/{match['accession']}-index.htm",
-        "total_chars": len(text),
-        "truncated": len(text) > max_chars,
-        "text": text[:max_chars],
-    }
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"Error inserting into DB: {e}")
+    finally:
+        db.close()
+
+@app.get("/trend-analysis/{ticker}")
+def get_trend_analysis(ticker: str):
+    db = SessionLocal()
+    try:
+        result = trend_analysis.analyze_company_trends(db, ticker)
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    finally:
+        db.close()
+
+@app.get("/report/{ticker}")
+async def get_report(
+    ticker: str = Path(..., description="Company ticker, e.g. AAPL"),
+    form_type: str = Query("10-K", description="Filing type (10-K, 10-Q, 8-K)")
+):
+    report = await build_full_report(ticker, form_type)
+    # Insert report into the database
+    insert_report_to_db(report)
+    return report
+
+@app.get("/filing/latest")
+async def get_latest_compat(
+    ticker: str = Query(..., description="Company ticker, e.g. AAPL"),
+    form_type: str = Query("10-K", description="Filing type (10-K, 10-Q, 8-K)")
+):
+    report = await build_full_report(ticker, form_type)
+    # Insert report into the database
+    insert_report_to_db(report)
+    return report
+
+@app.get("/")
+def root():
+    return {"message": "Advanced XBRL Financial API Running."}
